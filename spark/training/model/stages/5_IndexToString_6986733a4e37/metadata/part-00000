@@ -1,0 +1,1 @@
+{"class":"org.apache.spark.ml.feature.IndexToString","timestamp":1751814724427,"sparkVersion":"3.4.4","uid":"IndexToString_6986733a4e37","paramMap":{"labels":["Frontend","Backend","Cloud/Network","Cybersecurity","Fullstack","IA"],"outputCol":"predicted_category","inputCol":"prediction"},"defaultParamMap":{"outputCol":"IndexToString_6986733a4e37__output"}}

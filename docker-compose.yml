@@ -1,0 +1,155 @@
+version: '3.9'  
+
+services:
+  redditscraper:
+    build: ./scraper  # Build the Reddit scraper container using the Dockerfile in "./scraper" folder
+    container_name: scraper 
+    env_file: .env  # Load environment variables from the .env file
+    depends_on:
+      - fluentd  # Wait until Fluentd is ready before starting the scraper
+    volumes:
+      - ./scraper:/app  # Sync the local "./scraper" folder with the container 
+    networks:
+      - data-pipeline  # Connect this container to data-pipeline network
+
+  fluentd:
+    build: ./fluentd  
+    container_name: fluentd
+    ports:
+      - "24224:24224"        # Maps port 24224 on the host to the container to allow data to Fluentd
+      - "24224:24224/udp"    
+    volumes:
+      - ./fluentd/fluent.conf:/fluentd/etc/fluent.conf  # Use a custom Fluentd config file
+    depends_on:
+      topics:
+        condition: service_completed_successfully  # Wait until the "topics" container finishes successfully
+    networks:
+      - data-pipeline
+
+  broker:
+    image: apache/kafka:4.0.0  # Use the official Kafka image from Docker Hub
+    container_name: broker 
+    ports:
+      - '9092:9092' 
+    environment:
+      # Configuration settings to run Kafka in "KRaft" mode (Kafka without ZooKeeper)
+      KAFKA_NODE_ID: 1
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT'
+      KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT_HOST://broker:9092,PLAINTEXT://broker:19092'
+      KAFKA_PROCESS_ROLES: 'broker,controller'
+      KAFKA_CONTROLLER_QUORUM_VOTERS: '1@broker:29093'
+      KAFKA_LISTENERS: 'CONTROLLER://:29093,PLAINTEXT_HOST://:9092,PLAINTEXT://:19092'
+      KAFKA_INTER_BROKER_LISTENER_NAME: 'PLAINTEXT'
+      KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+      CLUSTER_ID: 'D2QRq5CMTD2W3TIfBqmC6g'
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_LOG_DIRS: '/tmp/kraft-combined-logs'
+    networks:
+      - data-pipeline
+
+  topics:
+    image: apache/kafka:4.0.0  # This container uses the same Kafka image
+    environment:
+      - PYSPARK_PYTHON=/usr/local/bin/python3 
+      - PYSPARK_DRIVER_PYTHON=/usr/local/bin/python3
+    command: >
+      bash -c "
+      echo 'Waiting for Kafka broker to be ready...';
+      while ! nc -z broker 9092; do 
+        sleep 2;
+      done;
+      echo 'Creating topic...';
+      /opt/kafka/bin/kafka-topics.sh --create --topic redditjob --bootstrap-server broker:9092 --partitions 1 --replication-factor 1;
+      echo 'Topic redditjob created successfully!';
+      "
+    # Wait until Kafka is ready, then create a topic called "redditjob"
+    depends_on:
+      - broker
+    networks:
+      - data-pipeline
+
+  spark:
+    build:
+      context: ./spark  
+    container_name: spark
+    ports:
+      - '8080:8080'  # Spark Web UI
+      - '7077:7077'  # Port waiting for workers to connect
+    volumes:
+      - ./spark/checkpoint:/app/checkpoint  # For saving job states
+      - ./spark/ivy-cache:/ivy  # Cache for downloaded packages
+
+    depends_on:
+      - topics       # Wait for Kafka topics to be created
+      - elasticsearch  # Wait for Elasticsearch to be up
+    
+    networks:
+      - data-pipeline
+    restart: always  # If it crashes, restart it automatically
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.17.0
+    container_name: elasticsearch
+    environment:
+      - discovery.type=single-node  # Run it in single-node mode 
+      - xpack.security.enabled=false  
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"  # Limit memory use
+    ports:
+      - "9200:9200"  # REST API port
+      - "9300:9300"  # Cluster communication port (not being used at the moment)
+    volumes:
+      - elasticsearch-data:/usr/share/elasticsearch/data  # Save ES data to a volume
+    networks:
+      - data-pipeline
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.17.0
+    container_name: kibana
+    ports:
+      - "5601:5601"  # Kibana dashboard port
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200  # Connect to the Elasticsearch container
+    depends_on:
+      - elasticsearch
+    networks:
+      - data-pipeline
+
+  #Auto import kibana dashboard
+  dashboard-importer:
+    image: appropriate/curl  # minimal curl image
+    depends_on:
+      - kibana
+    entrypoint: 
+      - sh
+      - -c
+      - |
+        echo 'Waiting for Kibana...'
+        until curl -s http://kibana:5601/api/status | grep -q '"level":"available"'; do
+          echo 'Kibana not ready, waiting...'
+          sleep 5
+        done
+
+        echo 'Kibana ready, importing dashboard...'
+        curl -X POST 'http://kibana:5601/api/saved_objects/_import?overwrite=true' \
+            -H 'kbn-xsrf: true' \
+            --form file=@/dashboard/dashboard.ndjson
+
+        echo 'Dashboard imported!'
+          sleep 60;  # tieni il container vivo un po'
+        "]
+    volumes:
+      - ./dashboard:/dashboard
+    networks:
+      - data-pipeline
+
+# Define network that containers use to communicate
+networks:
+  data-pipeline:
+    driver: bridge # default
+
+# Persistent ES volume
+volumes:
+  elasticsearch-data:
