@@ -1,3 +1,4 @@
+
 import time
 import pandas as pd
 import re
@@ -7,32 +8,32 @@ from pyspark.sql.functions import col, udf, from_json, concat_ws, when, size
 from pyspark.sql.types import StructType, StructField, StringType, ArrayType
 from pyspark.ml import PipelineModel
 
-print("=== Avvio script streaming Kafka → Regex Skill → Elasticsearch ===")
+print("Starting Kafka to Spark to Elasticsearch streaming pipeline")
 start_total = time.time()
 
-# === 1. Spark session ===
-print("→ Inizializzo SparkSession...")
-spark = SparkSession.builder.appName("KafkaSkillRegexExtractor").getOrCreate()
-print("✓ SparkSession inizializzata")
+# Initialize Spark session
+print("Initializing SparkSession")
+spark = SparkSession.builder.appName("SkillCategoryExtractor").getOrCreate()
+print("SparkSession initialized")
 
-# === 2. Carica lista skill ===
+# Load skill list from CSV file
 skills_path = "skill_list.csv"
-print(f"→ Carico skill list da: {skills_path}")
+print(f"Loading skill list from {skills_path}")
 start = time.time()
 skill_df = pd.read_csv(skills_path)
 skill_df.columns = [c.strip().lower() for c in skill_df.columns]
 skills = skill_df["skill"].dropna().str.lower().unique().tolist()
-print(f"✓ Skill caricate: {len(skills)} in {time.time() - start:.2f} s")
+print(f"Loaded {len(skills)} skills in {time.time() - start:.2f} seconds")
 
-# === 3. Prepara regex e broadcast ===
-print("→ Preparo regex pattern e broadcast...")
+# Prepare regular expression pattern for skill matching and broadcast to Spark workers
+print("Preparing regex pattern and broadcasting")
 start = time.time()
 escaped_skills = sorted([re.escape(skill) for skill in skills], key=len, reverse=True)
 pattern = r'(?<!\w)(?:' + '|'.join(escaped_skills) + r')(?!\w)'
 broadcast_pattern = spark.sparkContext.broadcast(pattern)
-print(f"✓ Pattern pronto in {time.time() - start:.2f} s")
+print(f"Regex pattern ready in {time.time() - start:.2f} seconds")
 
-# === 4. UDF per estrazione skill con pulizia conservativa ===
+# Define user-defined function to extract skills from text using regex pattern
 @udf(ArrayType(StringType()))
 def extract_skills(text):
     if not text:
@@ -45,10 +46,10 @@ def extract_skills(text):
         found = re.findall(broadcast_pattern.value, text_clean)
         return found
     except Exception as e:
-        print(f"Errore in extract_skills: {e}")
+        print(f"Error in extract_skills: {e}")
         return []
 
-# === 5. Schema JSON in arrivo da Kafka ===
+# Define schema of JSON messages coming from Kafka
 schema = StructType([
     StructField("id", StringType()),
     StructField("title", StringType()),
@@ -56,43 +57,39 @@ schema = StructType([
     StructField("selftext", StringType())
 ])
 
-# === 6. Lettura da Kafka ===
-print("→ Connessione a Kafka...")
+# Connect to Kafka and read streaming data from topic
+print("Connecting to Kafka")
 start = time.time()
 df = spark.readStream.format("kafka") \
     .option("kafka.bootstrap.servers", "broker:9092") \
     .option("subscribe", "redditjob") \
     .option("startingOffsets", "earliest") \
     .load()
-print(f"✓ Connesso a Kafka in {time.time() - start:.2f} s")
+print(f"Connected to Kafka in {time.time() - start:.2f} seconds")
 
-# === 7. Parsing JSON ===
-print("→ Parsing JSON dai messaggi Kafka...")
+# Parse JSON strings from Kafka messages into structured columns
+print("Parsing JSON from Kafka messages")
 posts = df.selectExpr("CAST(value AS STRING) as json_str") \
     .select(from_json(col("json_str"), schema).alias("data")) \
     .select("data.*")
 
-# === 8. Prepara testo e colonna skills ===
-print("→ Estraggo skill dai testi...")
+# Combine title and selftext into a single text column and extract skills using UDF
+print("Extracting skills from text")
 posts = posts.withColumn("text", concat_ws(" ", col("title"), col("selftext")))
 posts = posts.withColumn("skills_array", extract_skills(col("text")))
 posts = posts.withColumn("skills", concat_ws(", ", col("skills_array")))
 
-print("→ Carico modello ML salvato...")
-model_path = "model"  # percorso modello salvato con .save()
+# Load pre-trained machine learning model for category prediction
+print("Loading saved ML model")
+model_path = "model"
 model = PipelineModel.load(model_path)
-print("✓ Modello caricato")
+print("Model loaded")
 
-# === 10. Prepara input per il modello ===
-# Il modello si aspetta una colonna "text", che abbiamo già
-
-# === 11. Applica modello per predizione categoria ===
-print("→ Applicazione modello per predizione categoria...")
+# Apply model to predict category of job posts
+print("Applying model to predict category")
 predictions = model.transform(posts)
 
-# === 9. Output finale ===
-predictions = model.transform(posts)
-
+# Prepare final output including predicted category and skills
 output = predictions.withColumn(
     "category",
     when(size(col("skills_array")) == 0, "other").otherwise(col("predicted_category"))
@@ -105,7 +102,7 @@ output = predictions.withColumn(
     "skills_array"
 )
 
-# Scrittura su Elasticsearch
+# Write results to Elasticsearch using streaming write
 query = output.writeStream \
     .format("org.elasticsearch.spark.sql") \
     .option("es.nodes", "elasticsearch") \
@@ -116,4 +113,5 @@ query = output.writeStream \
     .outputMode("append") \
     .start()
 
+# Wait for streaming to finish
 query.awaitTermination()
