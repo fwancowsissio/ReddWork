@@ -1,1 +1,0 @@
-{"class":"org.apache.spark.ml.feature.RegexTokenizer","timestamp":1751814723790,"sparkVersion":"3.4.4","uid":"RegexTokenizer_b6f84818e3bb","paramMap":{"inputCol":"skills","outputCol":"tokens","pattern":",","toLowercase":false},"defaultParamMap":{"outputCol":"RegexTokenizer_b6f84818e3bb__output","gaps":true,"pattern":"\\s+","minTokenLength":1,"toLowercase":true}}
